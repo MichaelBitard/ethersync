@@ -18,6 +18,7 @@ local user_cursors = {}
 local cursor_namespace = vim.api.nvim_create_namespace("Ethersync")
 local offset_encoding = "utf-32"
 local cursor_timeout_ms = 300 * 1000
+local following_userid = nil
 
 local function show_cursor_information(name, cursor)
     return name .. " @ " .. vim.uri_to_fname(cursor.uri) .. ":" .. cursor.range.start.line + 1
@@ -45,6 +46,17 @@ local function jump(location)
     end
 end
 
+local function follow(user_id)
+    local cursors = user_cursors[user_id].cursors
+    local cursor = cursors[#cursors]
+    local location = {
+        targetUri = cursor.uri,
+        targetRange = cursor.range,
+        targetSelectionRange = cursor.range,
+    }
+    jump(location)
+end
+
 -- A new set of ranges means, we delete all existing ones for that user.
 function M.set_cursor(uri, user_id, name, ranges)
     -- Find correct buffer to apply edits to.
@@ -66,72 +78,74 @@ function M.set_cursor(uri, user_id, name, ranges)
         for _, range in ipairs(ranges) do
             table.insert(user_cursors[user_id].cursors, { uri = uri, range = range, extmark = nil })
         end
-        return
-    end
+    else
+        for i, range in ipairs(ranges) do
+            -- Convert from LSP style ranges to Neovim style ranges.
+            local start_row = range.start.line
+            local start_col = vim.lsp.util._get_line_byte_from_position(bufnr, range.start, offset_encoding)
+            local end_row = range["end"].line
+            local end_col = vim.lsp.util._get_line_byte_from_position(bufnr, range["end"], offset_encoding)
 
-    for i, range in ipairs(ranges) do
-        -- Convert from LSP style ranges to Neovim style ranges.
-        local start_row = range.start.line
-        local start_col = vim.lsp.util._get_line_byte_from_position(bufnr, range.start, offset_encoding)
-        local end_row = range["end"].line
-        local end_col = vim.lsp.util._get_line_byte_from_position(bufnr, range["end"], offset_encoding)
-
-        -- If the range is backwards, swap the start and end positions.
-        if not is_forward(start_row, end_row, start_col, end_col) then
-            start_row, end_row = end_row, start_row
-            start_col, end_col = end_col, start_col
-        end
-
-        -- If the range is empty, expand the highlighted range by 1 to make it visible.
-        if start_row == end_row and start_col == end_col then
-            local bytes_in_end_row = vim.fn.strlen(vim.fn.getline(end_row + 1))
-            if bytes_in_end_row > end_col then
-                -- Note: Instead of 1, we should actually add the byte length of the character at this position.
-                end_col = end_col + 1
-            elseif bytes_in_end_row > 0 then
-                -- This highlights the last character in the row.
-                start_col = start_col - 1
+            -- If the range is backwards, swap the start and end positions.
+            if not is_forward(start_row, end_row, start_col, end_col) then
+                start_row, end_row = end_row, start_row
+                start_col, end_col = end_col, start_col
             end
-        end
 
-        local e = {
-            start_row = start_row,
-            start_col = start_col,
-            end_row = end_row,
-            end_col = end_col,
-        }
-
-        local virt_text = {}
-        if i == 1 and name then
-            virt_text = { { name, "EthersyncUsername" } }
-        end
-
-        -- Try setting the extmark, ignore errors (which can happen at end of lines/buffers).
-        pcall(function()
-            local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, cursor_namespace, e.start_row, e.start_col, {
-                hl_mode = "combine",
-                hl_group = "TermCursor",
-                end_col = e.end_col,
-                end_row = e.end_row,
-                virt_text = virt_text,
-            })
-            vim.defer_fn(function()
-                vim.api.nvim_buf_del_extmark(bufnr, cursor_namespace, extmark_id)
-                for _, user_cursor in ipairs(user_cursors[user_id].cursors) do
-                    if user_cursor.extmark ~= nil and user_cursor.extmark.id == extmark_id then
-                        -- If we find our own extmark_id, we can remove all ranges,
-                        -- because they were all created at the same time.
-                        user_cursors[user_id].cursors = {}
-                        break
-                    end
+            -- If the range is empty, expand the highlighted range by 1 to make it visible.
+            if start_row == end_row and start_col == end_col then
+                local bytes_in_end_row = vim.fn.strlen(vim.fn.getline(end_row + 1))
+                if bytes_in_end_row > end_col then
+                    -- Note: Instead of 1, we should actually add the byte length of the character at this position.
+                    end_col = end_col + 1
+                elseif bytes_in_end_row > 0 then
+                    -- This highlights the last character in the row.
+                    start_col = start_col - 1
                 end
-            end, cursor_timeout_ms)
+            end
 
-            table.insert(
-                user_cursors[user_id].cursors,
-                { uri = uri, range = range, extmark = { id = extmark_id, bufnr = bufnr } }
-            )
-        end)
+            local e = {
+                start_row = start_row,
+                start_col = start_col,
+                end_row = end_row,
+                end_col = end_col,
+            }
+
+            local virt_text = {}
+            if i == 1 and name then
+                virt_text = { { name, "EthersyncUsername" } }
+            end
+
+            -- Try setting the extmark, ignore errors (which can happen at end of lines/buffers).
+            pcall(function()
+                local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, cursor_namespace, e.start_row, e.start_col, {
+                    hl_mode = "combine",
+                    hl_group = "TermCursor",
+                    end_col = e.end_col,
+                    end_row = e.end_row,
+                    virt_text = virt_text,
+                })
+                vim.defer_fn(function()
+                    vim.api.nvim_buf_del_extmark(bufnr, cursor_namespace, extmark_id)
+                    for _, user_cursor in ipairs(user_cursors[user_id].cursors) do
+                        if user_cursor.extmark ~= nil and user_cursor.extmark.id == extmark_id then
+                            -- If we find our own extmark_id, we can remove all ranges,
+                            -- because they were all created at the same time.
+                            user_cursors[user_id].cursors = {}
+                            break
+                        end
+                    end
+                end, cursor_timeout_ms)
+
+                table.insert(
+                    user_cursors[user_id].cursors,
+                    { uri = uri, range = range, extmark = { id = extmark_id, bufnr = bufnr } }
+                )
+            end)
+        end
+    end
+    if following_userid == user_id then
+        follow(user_id)
     end
 end
 
@@ -233,6 +247,79 @@ function M.track_cursor(bufnr, callback)
     vim.api.nvim_exec_autocmds("CursorMoved", {})
 end
 
+function M.stop_follow()
+    following_userid = nil
+end
+
+function M.follow_cursor()
+    local users = {}
+    local descriptions = {}
+    local max_width = 10
+    local locations = {}
+    for user_id, data in pairs(user_cursors) do
+        local _, cursor = next(data.cursors)
+        if cursor then
+            local description = show_cursor_information(data.name, cursor)
+            local desc_width = vim.fn.strdisplaywidth(description)
+            if desc_width > max_width then
+                max_width = desc_width
+            end
+
+            table.insert(descriptions, description)
+
+            table.insert(users, user_id)
+            table.insert(locations, {
+                targetUri = cursor.uri,
+                targetRange = cursor.range,
+                targetSelectionRange = cursor.range,
+            })
+        end
+    end
+
+    if #users == 0 then
+        print("No user to follow.")
+    elseif #users == 1 then
+        following_userid = users[1]
+        follow(following_userid)
+    else
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, true, descriptions)
+        vim.bo[buf].modifiable = false
+
+        local opts = {
+            relative = "cursor",
+            width = max_width,
+            height = #descriptions,
+            col = 0,
+            row = 1,
+            anchor = "NW",
+            style = "minimal",
+            border = "single",
+        }
+        local win = vim.api.nvim_open_win(buf, true, opts)
+
+        vim.api.nvim_buf_set_keymap(buf, "n", "<CR>", "", {
+            callback = function()
+                local line_number = vim.fn.line(".")
+                local location = locations[line_number]
+                vim.api.nvim_win_close(win, true)
+                jump(location)
+            end,
+        })
+        vim.api.nvim_buf_set_keymap(buf, "n", "<Esc>", "", {
+            callback = function()
+                vim.api.nvim_win_close(win, true)
+            end,
+        })
+        vim.api.nvim_create_autocmd("BufLeave", {
+            buffer = buf,
+            callback = function()
+                vim.api.nvim_win_close(win, true)
+            end,
+        })
+    end
+end
+
 function M.jump_to_cursor()
     local descriptions = {}
     local locations = {}
@@ -311,7 +398,7 @@ function M.list_cursors()
         for _, data in pairs(user_cursors) do
             local name = data.name
             local cursors = data.cursors
-            message = message .. name .. ":"
+            message = message .. (name or "") .. ":"
             if #cursors == 0 then
                 message = message .. " No cursors"
             elseif #cursors == 1 then
